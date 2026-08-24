@@ -23,6 +23,13 @@ credential-read capability. That doesn't work for self-service screens, where
 an application should answer the question with the user's own token and
 nothing more.
 
+In many deployments the Admin API is not even an option: security-conscious
+setups firewall it to an internal network, or run their public-facing node
+from an image built with `--features-disabled=admin,admin-api`, where admin
+endpoints don't exist at all. This extension works in every one of those
+setups, because it is entirely user-based — a realm resource authorized by
+the caller's own account token, with no admin surface anywhere in the path.
+
 Keycloak's built-in Account REST API has a credentials endpoint, but it only
 lists credential types referenced by an *enabled authenticator in an active
 authentication flow* (via `CredentialValidator`). A realm using custom
