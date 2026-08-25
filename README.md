@@ -149,6 +149,17 @@ Contributions are welcome. Please open an issue first to discuss proposed change
 For security problems, follow the [security policy](SECURITY.md) instead of opening
 a public issue.
 
+## Related Extensions
+
+Part of a small family of self-contained Keycloak extensions:
+
+- [keycloak-account-events](https://github.com/AdrianIAna/keycloak-account-events) —
+  the same self-scoped auth model applied to the event store: a user's own
+  login history, with their own token.
+- [keycloak-event-enrichment](https://github.com/AdrianIAna/keycloak-event-enrichment) —
+  enriches authentication events with GeoIP and device data at write time, so
+  that login history carries location and device fields.
+
 ## License
 
 [Apache License 2.0](LICENSE)
