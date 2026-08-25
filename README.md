@@ -1,7 +1,7 @@
 # Keycloak Account Credentials SPI
 
-A Keycloak SPI extension that lets a user retrieve their own credential
-inventory (passkeys, OTP, recovery codes, password — types and labels, never
+A Keycloak SPI extension that lets a user retrieve — and remove — their own
+credentials (passkeys, OTP, recovery codes, password — types and labels, never
 secrets) from the account console or any first-party application, using the
 user's own access token. No admin credentials involved.
 
@@ -39,12 +39,18 @@ endpoint omits entirely, holders included. This extension reads the caller's
 credential store directly, so the inventory is truthful regardless of how the
 realm's flows authenticate.
 
+And what the listing cannot name, its delete can never be asked to remove: on
+such a realm the built-in removal path is unreachable for exactly the
+credentials users care about. The extension therefore pairs the truthful
+inventory with a removal endpoint of identical semantics to the built-in one.
+
 ## How It Works
 
 The extension registers a `RealmResourceProvider` that serves:
 
 ```
-GET /realms/{realm}/account-credentials/me
+GET    /realms/{realm}/account-credentials/me
+DELETE /realms/{realm}/account-credentials/{credentialId}
 ```
 
 Each request goes through the same gatekeeping as Keycloak's built-in account
@@ -60,22 +66,39 @@ API:
    browser callers; a preflight `OPTIONS` handler is included.
 5. Service-account tokens (`client_credentials`) are rejected with `401`.
 6. The token must carry the `account` client's `view-profile` or
-   `manage-account` role, else `403`.
-7. The caller's credential store is read, hard-scoped to the token's own
-   subject.
+   `manage-account` role to read, and `manage-account` alone to delete —
+   exactly how the built-in account API divides them — else `403`.
+7. The caller's credential store is read (or the credential removed),
+   hard-scoped to the token's own subject.
 
-There is no user-id request parameter anywhere — nor any request parameter at
-all: results are bound to the authenticated subject, so a caller can only ever
-read their own credentials.
+The inventory has no user-id request parameter anywhere — nor any request
+parameter at all: results are bound to the authenticated subject. The delete's
+`{credentialId}` is resolved *inside the caller's own store*, so another
+user's credential id is simply `404` — a caller can only ever read or remove
+their own credentials.
+
+### Removal semantics
+
+`DELETE` delegates to the same `CredentialDeleteHelper` Keycloak's built-in
+account API uses, so behaviour is identical: `404` for an id not in the
+caller's store, `400` for a credential type whose provider forbids removal
+(a password, for instance), and `403` when step-up authentication is
+configured and the current token's `acr` maps to a level of authentication
+below what removing that credential type requires. On success the same
+`REMOVE_CREDENTIAL` event is fired (with the legacy `REMOVE_TOTP` clone for
+OTP credentials), so realm event listeners and the event store see
+extension-initiated removals exactly like built-in ones.
 
 ### Responses
 
-| Status | Meaning |
-|--------|---------|
-| `200`  | Array of the caller's own stored credentials |
-| `401`  | Missing/invalid bearer token, wrong audience, or a service-account token |
-| `403`  | Token lacks the account `view-profile`/`manage-account` role, or disallowed CORS origin |
-| `404`  | The realm's `account` client is missing or disabled (mirrors the built-in account API) |
+| Status | `GET …/me` | `DELETE …/{credentialId}` |
+|--------|------------|---------------------------|
+| `200`  | Array of the caller's own stored credentials | — |
+| `204`  | — | Credential removed |
+| `400`  | — | Credential type cannot be removed (e.g. password) |
+| `401`  | Missing/invalid bearer token, wrong audience, or a service-account token | same |
+| `403`  | Token lacks the account `view-profile`/`manage-account` role, or disallowed CORS origin | token lacks `manage-account`, disallowed origin, or insufficient step-up level |
+| `404`  | The realm's `account` client is missing or disabled (mirrors the built-in account API) | same — or the id is not in the caller's own store |
 
 A `200` body:
 
@@ -108,10 +131,11 @@ silently.
 
 | Extension | Keycloak |
 |-----------|----------|
+| 0.2.x     | 26.6 – 26.7 (built against 26.7.2) |
 | 0.1.x     | 26.6 – 26.7 (built against 26.7.2) |
 
 Uses only `RealmResourceProvider`, `SubjectCredentialManager`, and the same
-gatekeeping utilities the built-in account API uses.
+gatekeeping and credential-removal utilities the built-in account API uses.
 
 ## Installation
 

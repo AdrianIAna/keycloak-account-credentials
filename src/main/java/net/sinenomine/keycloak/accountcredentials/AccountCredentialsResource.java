@@ -9,39 +9,56 @@
  */
 package net.sinenomine.keycloak.accountcredentials;
 
+import java.util.Map;
 import java.util.stream.Stream;
 
+import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.NotAuthorizedException;
 import jakarta.ws.rs.NotFoundException;
 import jakarta.ws.rs.OPTIONS;
 import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
 import org.jboss.resteasy.reactive.NoCache;
 
+import org.keycloak.authentication.requiredactions.util.CredentialDeleteHelper;
 import org.keycloak.credential.CredentialModel;
+import org.keycloak.events.Details;
+import org.keycloak.events.EventBuilder;
+import org.keycloak.events.EventType;
 import org.keycloak.models.AccountRoles;
 import org.keycloak.models.ClientModel;
 import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.RealmModel;
+import org.keycloak.models.UserModel;
+import org.keycloak.models.credential.OTPCredentialModel;
 import org.keycloak.protocol.oidc.AccessTokenIntrospectionProvider;
 import org.keycloak.protocol.oidc.AccessTokenIntrospectionProviderFactory;
 import org.keycloak.protocol.oidc.TokenIntrospectionProvider;
+import org.keycloak.protocol.oidc.utils.AcrUtils;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.services.cors.Cors;
 import org.keycloak.services.managers.AppAuthManager;
 import org.keycloak.services.managers.AuthenticationManager.AuthResult;
 
 /**
- * Account-scoped credential-inventory resource serving
- * {@code GET /realms/{realm}/account-credentials/me}: the authenticated
- * caller's own stored credentials — type, user label, creation date, and id.
+ * Account-scoped credential-inventory resource:
+ *
+ * <ul>
+ * <li>{@code GET /realms/{realm}/account-credentials/me} — the authenticated
+ * caller's own stored credentials: type, user label, creation date, and id.
  * Never secrets: {@code credentialData} and {@code secretData} are not part of
- * the response type at all.
+ * the response type at all.</li>
+ * <li>{@code DELETE /realms/{realm}/account-credentials/{credentialId}} —
+ * remove one of the caller's own credentials, with the exact semantics of the
+ * built-in account API's delete (same validation helper, same event).</li>
+ * </ul>
  *
  * <p>Why this exists: the built-in Account REST API's credentials endpoint
  * only reports credential types that an <em>enabled authenticator in an active
@@ -50,16 +67,20 @@ import org.keycloak.services.managers.AuthenticationManager.AuthResult;
  * example — is invisible to it: users demonstrably holding
  * {@code webauthn-passwordless} credentials get an answer that omits the type
  * entirely. This resource reads the caller's credential store directly, so the
- * inventory is truthful regardless of how the realm authenticates.
+ * inventory is truthful regardless of how the realm authenticates. The delete
+ * exists for the same reason one step later: a credential the built-in listing
+ * cannot name is a credential its delete can never be asked to remove.
  *
  * <p>The request pipeline mirrors Keycloak's built-in account API gatekeeping
  * (see {@code AccountLoader}): bearer-token authentication, lightweight-token
  * claim recovery via introspection, an {@code account} audience check, CORS
- * origin enforcement, service-account rejection, and finally the
- * {@code view-profile}/{@code manage-account} role requirement. Results are
- * always hard-scoped to the token's own subject — there is no user-id request
- * parameter (nor any parameter at all), so a caller can never read another
- * user's credentials.
+ * origin enforcement, service-account rejection, and finally the role
+ * requirement — {@code view-profile}/{@code manage-account} to read,
+ * {@code manage-account} alone to delete, exactly as the built-in account API
+ * divides them. Results and removals are always hard-scoped to the token's own
+ * subject: the inventory has no user-id parameter, and the delete resolves the
+ * credential id inside the caller's own store, so another user's credential id
+ * is simply not found.
  */
 public class AccountCredentialsResource {
 
@@ -75,7 +96,7 @@ public class AccountCredentialsResource {
      * {@code credentialData}/{@code secretData} columns cannot leak through a
      * type that never carries them.
      *
-     * @param id          credential id (stable handle, e.g. for a future remove flow)
+     * @param id          credential id (stable handle, e.g. for the remove flow)
      * @param type        credential type, e.g. {@code password}, {@code otp},
      *                    {@code webauthn}, {@code webauthn-passwordless},
      *                    {@code recovery-authn-codes}
@@ -83,6 +104,10 @@ public class AccountCredentialsResource {
      * @param createdDate creation time in epoch millis, may be {@code null}
      */
     public record CredentialSummary(String id, String type, String userLabel, Long createdDate) {
+    }
+
+    /** The authenticated caller: auth result plus the resolved (full-claim) token. */
+    record Caller(AuthResult auth, AccessToken token) {
     }
 
     /** CORS preflight for browser callers, mirroring the built-in account API. */
@@ -93,12 +118,84 @@ public class AccountCredentialsResource {
         return Cors.builder().auth().allowedMethods("GET", "OPTIONS").preflight().add(Response.ok());
     }
 
+    /** CORS preflight for the credential-removal path. */
+    @OPTIONS
+    @Path("{credentialId}")
+    public Response preflightDelete() {
+        requireEnabledAccountClient();
+        return Cors.builder().auth().allowedMethods("DELETE", "OPTIONS").preflight().add(Response.ok());
+    }
+
     /** @return the caller's own stored credentials, in store order */
     @GET
     @Path("me")
     @Produces(MediaType.APPLICATION_JSON)
     @NoCache
     public Stream<CredentialSummary> getCredentials() {
+        Caller caller = authenticateCaller("GET", false);
+
+        return caller.auth().user().credentialManager()
+                .getStoredCredentialsStream()
+                .map(AccountCredentialsResource::toSummary);
+    }
+
+    /**
+     * Remove one of the caller's own credentials.
+     *
+     * <p>Delegates to the same {@code CredentialDeleteHelper} the built-in
+     * account API's delete uses, so the semantics are identical: {@code 404}
+     * for an id not present in the caller's own store, {@code 400} for a type
+     * whose provider does not allow removal (a password, for instance), and
+     * {@code 403} when step-up authentication is configured and the current
+     * token's level of authentication is below what removing that credential
+     * type requires. On success the same {@code REMOVE_CREDENTIAL} event is
+     * fired, so realm event listeners (and anything reading the event store)
+     * see extension-initiated removals exactly like built-in ones.
+     *
+     * @param credentialId id of one of the caller's own credentials
+     * @return {@code 204 No Content} on success
+     */
+    @DELETE
+    @Path("{credentialId}")
+    @NoCache
+    public Response deleteCredential(@PathParam("credentialId") String credentialId) {
+        Caller caller = authenticateCaller("DELETE", true);
+        UserModel user = caller.auth().user();
+
+        CredentialModel removed = CredentialDeleteHelper.removeCredential(
+                session, user, credentialId,
+                () -> currentAuthenticatedLevel(session.getContext().getRealm(), caller.token()));
+
+        if (removed != null) {
+            EventBuilder event = new EventBuilder(
+                    session.getContext().getRealm(), session, session.getContext().getConnection())
+                    .client(caller.token().getIssuedFor())
+                    .user(user)
+                    .session(caller.auth().session())
+                    .event(EventType.REMOVE_CREDENTIAL)
+                    .detail(Details.CREDENTIAL_TYPE, removed.getType())
+                    .detail(Details.SELECTED_CREDENTIAL_ID, credentialId)
+                    .detail(Details.CREDENTIAL_USER_LABEL, removed.getUserLabel());
+            if (OTPCredentialModel.TYPE.equals(removed.getType())) {
+                event.clone().event(EventType.REMOVE_TOTP).success();
+            }
+            event.success();
+        }
+
+        return Response.noContent().build();
+    }
+
+    /**
+     * The shared gate, in the built-in account API's order: enabled account
+     * client, bearer authentication, lightweight-token claim recovery,
+     * {@code account} audience, CORS, service-account rejection, role.
+     *
+     * @param method               the HTTP method for CORS enforcement
+     * @param requireManageAccount {@code true} for mutations, which need
+     *                             {@code manage-account}; {@code false} for
+     *                             reads, where {@code view-profile} suffices
+     */
+    private Caller authenticateCaller(String method, boolean requireManageAccount) {
         requireEnabledAccountClient();
 
         AuthResult authResult = new AppAuthManager.BearerTokenAuthenticator(session).authenticate();
@@ -111,19 +208,21 @@ public class AccountCredentialsResource {
             throw new NotAuthorizedException("Invalid audience for client " + Constants.ACCOUNT_MANAGEMENT_CLIENT_ID);
         }
 
-        Cors.builder().checkAllowedOrigins(token).allowedMethods("GET").auth().add();
+        Cors.builder().checkAllowedOrigins(token).allowedMethods(method).auth().add();
 
         if (authResult.user().getServiceAccountClientLink() != null) {
             throw new NotAuthorizedException("Service accounts are not allowed to access this service");
         }
 
-        if (!hasAccountAccess(token)) {
+        if (requireManageAccount) {
+            if (!hasManageAccount(token)) {
+                throw new ForbiddenException("Requires account management (manage-account)");
+            }
+        } else if (!hasAccountAccess(token)) {
             throw new ForbiddenException("Requires account access (view-profile or manage-account)");
         }
 
-        return authResult.user().credentialManager()
-                .getStoredCredentialsStream()
-                .map(AccountCredentialsResource::toSummary);
+        return new Caller(authResult, token);
     }
 
     /**
@@ -171,6 +270,40 @@ public class AccountCredentialsResource {
         return access != null
                 && (access.isUserInRole(AccountRoles.VIEW_PROFILE)
                         || access.isUserInRole(AccountRoles.MANAGE_ACCOUNT));
+    }
+
+    /** Whether the token carries the {@code account} client's {@code manage-account} role. */
+    static boolean hasManageAccount(AccessToken token) {
+        if (token == null) {
+            return false;
+        }
+        AccessToken.Access access = token.getResourceAccess(Constants.ACCOUNT_MANAGEMENT_CLIENT_ID);
+        return access != null && access.isUserInRole(AccountRoles.MANAGE_ACCOUNT);
+    }
+
+    /**
+     * The caller's current level of authentication, from the token's {@code acr}
+     * claim — the built-in account API's logic, verbatim: map through the
+     * issuing client's ACR-to-LoA map, fall back to parsing a numeric acr, and
+     * refuse tokens that carry no usable acr at all. Feeds the step-up check in
+     * {@code CredentialDeleteHelper}.
+     */
+    static Integer currentAuthenticatedLevel(RealmModel realm, AccessToken token) {
+        ClientModel client = realm.getClientByClientId(token.getIssuedFor());
+        Map<String, Integer> acrLoaMap = AcrUtils.getAcrLoaMap(client);
+        String tokenAcr = token.getAcr();
+        if (tokenAcr == null) {
+            throw new ForbiddenException("No LoA on the token");
+        }
+        Integer currentAuthenticatedLevel = acrLoaMap.get(tokenAcr);
+        if (currentAuthenticatedLevel != null) {
+            return currentAuthenticatedLevel;
+        }
+        try {
+            return Integer.parseInt(tokenAcr);
+        } catch (NumberFormatException nfe) {
+            throw new ForbiddenException("Unsupported acr on the token");
+        }
     }
 
     /** Reduce a stored credential to its inventory summary. Secrets never map. */

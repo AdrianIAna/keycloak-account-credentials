@@ -6,19 +6,20 @@
 
     <groupId>net.sinenomine.keycloak</groupId>
     <artifactId>keycloak-account-credentials</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
 
     <name>Keycloak Account Credentials SPI</name>
     <description>
         Keycloak extension serving a user's own credential inventory (types,
         labels, creation dates - never secrets) at
-        /realms/{realm}/account-credentials/me, authorized by the caller's own
-        account access token - no admin credentials required. Unlike the
-        built-in Account REST API's credentials endpoint, the listing does not
-        depend on which authenticators the realm's flows reference, so
-        credential types managed by custom authenticators (e.g. passkey-first
-        flows) are reported truthfully.
+        /realms/{realm}/account-credentials/me, and self-scoped credential
+        removal at DELETE /realms/{realm}/account-credentials/{id}, authorized
+        by the caller's own account access token - no admin credentials
+        required. Unlike the built-in Account REST API's credentials endpoint,
+        the listing does not depend on which authenticators the realm's flows
+        reference, so credential types managed by custom authenticators (e.g.
+        passkey-first flows) are reported truthfully - and become removable.
     </description>
     <url>https://github.com/AdrianIAna/keycloak-account-credentials</url>
 
