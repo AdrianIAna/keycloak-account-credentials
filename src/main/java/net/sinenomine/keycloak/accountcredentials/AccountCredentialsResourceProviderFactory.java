@@ -20,23 +20,36 @@ import org.keycloak.services.resource.RealmResourceProviderFactory;
  * under the realm-relative path segment returned by {@link #getId()}, so the
  * endpoint is served at {@code /realms/{realm}/account-credentials}.
  *
- * <p>No provider-specific configuration: a user's credential inventory is a
- * handful of rows, so there is nothing to cap or tune. The provider can be
- * disabled wholesale via the standard SPI switch
- * ({@code --spi-realm-restapi-extension--account-credentials--enabled=false}).
+ * <p>One configuration option, {@code delete-max-auth-age}: the maximum age,
+ * in seconds, of the caller's authentication for the credential-removal
+ * endpoint (default {@value #DEFAULT_DELETE_MAX_AUTH_AGE}; {@code 0} disables
+ * the check). Set via the standard SPI option syntax, e.g.
+ * {@code --spi-realm-restapi-extension--account-credentials--delete-max-auth-age=300}.
+ * The provider can be disabled wholesale via
+ * {@code --spi-realm-restapi-extension--account-credentials--enabled=false}.
  */
 public class AccountCredentialsResourceProviderFactory implements RealmResourceProviderFactory {
 
     public static final String ID = "account-credentials";
 
+    /**
+     * Default freshness window for credential removal, in seconds. Sixty
+     * seconds is deliberately "the tap you just did": long enough to cover a
+     * reauthenticate-and-retry round trip, short enough that removal always
+     * rides a deliberate, recent authentication rather than an old session.
+     */
+    public static final int DEFAULT_DELETE_MAX_AUTH_AGE = 60;
+
+    private int deleteMaxAuthAge = DEFAULT_DELETE_MAX_AUTH_AGE;
+
     @Override
     public RealmResourceProvider create(KeycloakSession session) {
-        return new AccountCredentialsResourceProvider(session);
+        return new AccountCredentialsResourceProvider(session, deleteMaxAuthAge);
     }
 
     @Override
     public void init(Config.Scope config) {
-        // no configuration
+        deleteMaxAuthAge = config.getInt("delete-max-auth-age", DEFAULT_DELETE_MAX_AUTH_AGE);
     }
 
     @Override

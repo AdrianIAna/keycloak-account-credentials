@@ -27,6 +27,7 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.resteasy.reactive.NoCache;
 
 import org.keycloak.authentication.requiredactions.util.CredentialDeleteHelper;
+import org.keycloak.common.util.Time;
 import org.keycloak.credential.CredentialModel;
 import org.keycloak.events.Details;
 import org.keycloak.events.EventBuilder;
@@ -37,6 +38,7 @@ import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.UserSessionModel;
 import org.keycloak.models.credential.OTPCredentialModel;
 import org.keycloak.protocol.oidc.AccessTokenIntrospectionProvider;
 import org.keycloak.protocol.oidc.AccessTokenIntrospectionProviderFactory;
@@ -45,6 +47,7 @@ import org.keycloak.protocol.oidc.utils.AcrUtils;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.services.cors.Cors;
 import org.keycloak.services.managers.AppAuthManager;
+import org.keycloak.services.managers.AuthenticationManager;
 import org.keycloak.services.managers.AuthenticationManager.AuthResult;
 
 /**
@@ -84,10 +87,15 @@ import org.keycloak.services.managers.AuthenticationManager.AuthResult;
  */
 public class AccountCredentialsResource {
 
-    private final KeycloakSession session;
+    /** Machine-readable marker in the 403 body when removal needs a fresh login. */
+    public static final String ERROR_REAUTHENTICATION_REQUIRED = "reauthentication_required";
 
-    public AccountCredentialsResource(KeycloakSession session) {
+    private final KeycloakSession session;
+    private final int deleteMaxAuthAge;
+
+    public AccountCredentialsResource(KeycloakSession session, int deleteMaxAuthAge) {
         this.session = session;
+        this.deleteMaxAuthAge = deleteMaxAuthAge;
     }
 
     /**
@@ -142,6 +150,19 @@ public class AccountCredentialsResource {
     /**
      * Remove one of the caller's own credentials.
      *
+     * <p>Removing a credential is how an account takeover consolidates itself,
+     * so beyond the role check it requires a <em>recent</em> authentication:
+     * the caller's session must have authenticated within the configured
+     * {@code delete-max-auth-age} window (default 60s; {@code 0} disables).
+     * A stale session gets {@code 403} with
+     * {@code {"error":"reauthentication_required"}} — the client's cue to send
+     * the user through a fresh login ({@code prompt=login}) and retry. The
+     * freshness source is the server-side user session ({@code AUTH_TIME}
+     * note, falling back to the session start), not a token claim: access
+     * tokens from some grants carry no {@code auth_time}, and a
+     * re-authentication updates the session the caller's existing token
+     * already maps to, so the retry needs no token refresh.
+     *
      * <p>Delegates to the same {@code CredentialDeleteHelper} the built-in
      * account API's delete uses, so the semantics are identical: {@code 404}
      * for an id not present in the caller's own store, {@code 400} for a type
@@ -160,6 +181,7 @@ public class AccountCredentialsResource {
     @NoCache
     public Response deleteCredential(@PathParam("credentialId") String credentialId) {
         Caller caller = authenticateCaller("DELETE", true);
+        requireRecentAuthentication(caller);
         UserModel user = caller.auth().user();
 
         CredentialModel removed = CredentialDeleteHelper.removeCredential(
@@ -183,6 +205,42 @@ public class AccountCredentialsResource {
         }
 
         return Response.noContent().build();
+    }
+
+    /**
+     * Refuse a stale session for credential removal. Freshness comes from the
+     * server-side user session: the {@code AUTH_TIME} note (updated by every
+     * interactive authentication, including a {@code prompt=login} pass over
+     * an existing SSO session) with the session's start time as the fallback
+     * (a freshly-created session — a direct grant, for instance — carries the
+     * authentication moment as its start and may have no note yet).
+     */
+    private void requireRecentAuthentication(Caller caller) {
+        if (deleteMaxAuthAge <= 0) {
+            return;
+        }
+        int authTime = authTimeOf(caller.auth().session());
+        if (Time.currentTime() - authTime > deleteMaxAuthAge) {
+            throw new ForbiddenException(Response.status(Response.Status.FORBIDDEN)
+                    .entity(Map.of(
+                            "error", ERROR_REAUTHENTICATION_REQUIRED,
+                            "maxAuthAgeSeconds", deleteMaxAuthAge))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build());
+        }
+    }
+
+    /** The session's last interactive-authentication time, in epoch seconds. */
+    static int authTimeOf(UserSessionModel userSession) {
+        String note = userSession == null ? null : userSession.getNote(AuthenticationManager.AUTH_TIME);
+        if (note != null) {
+            try {
+                return Integer.parseInt(note);
+            } catch (NumberFormatException ignored) {
+                // fall through to the session start
+            }
+        }
+        return userSession == null ? 0 : userSession.getStarted();
     }
 
     /**

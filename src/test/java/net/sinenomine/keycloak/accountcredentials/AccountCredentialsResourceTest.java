@@ -27,6 +27,7 @@ import static org.mockito.Mockito.when;
 import java.lang.reflect.RecordComponent;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -45,6 +46,7 @@ import org.mockito.MockedStatic;
 
 import org.keycloak.authentication.requiredactions.util.CredentialDeleteHelper;
 import org.keycloak.common.ClientConnection;
+import org.keycloak.common.util.Time;
 import org.keycloak.credential.CredentialModel;
 import org.keycloak.events.Details;
 import org.keycloak.events.Event;
@@ -71,6 +73,7 @@ import org.keycloak.protocol.oidc.TokenIntrospectionProvider;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.services.cors.Cors;
 import org.keycloak.services.managers.AppAuthManager;
+import org.keycloak.services.managers.AuthenticationManager;
 import org.keycloak.services.managers.AuthenticationManager.AuthResult;
 import org.keycloak.utils.KeycloakSessionUtil;
 
@@ -302,7 +305,7 @@ class AccountCredentialsResourceTest {
 
         try (var ignored = mockAuthenticator(auth)) {
             List<CredentialSummary> result;
-            try (Stream<CredentialSummary> s = new AccountCredentialsResource(session).getCredentials()) {
+            try (Stream<CredentialSummary> s = new AccountCredentialsResource(session, 0).getCredentials()) {
                 result = s.collect(Collectors.toList());
             }
             assertEquals(2, result.size());
@@ -330,7 +333,7 @@ class AccountCredentialsResourceTest {
     void deleteCredential_accountClientMissing_notFound() {
         KeycloakSession session = sessionWithAccountClient(null);
         assertThrows(NotFoundException.class,
-                () -> new AccountCredentialsResource(session).deleteCredential("x"));
+                () -> new AccountCredentialsResource(session, 0).deleteCredential("x"));
     }
 
     @Test
@@ -338,7 +341,7 @@ class AccountCredentialsResourceTest {
         KeycloakSession session = sessionWithEnabledAccountClient();
         try (var ignored = mockAuthenticator(null)) {
             assertThrows(NotAuthorizedException.class,
-                    () -> new AccountCredentialsResource(session).deleteCredential("x"));
+                    () -> new AccountCredentialsResource(session, 0).deleteCredential("x"));
         }
     }
 
@@ -350,7 +353,7 @@ class AccountCredentialsResourceTest {
         when(auth.user().getServiceAccountClientLink()).thenReturn("some-client");
         try (var ignored = mockAuthenticator(auth)) {
             assertThrows(NotAuthorizedException.class,
-                    () -> new AccountCredentialsResource(session).deleteCredential("x"));
+                    () -> new AccountCredentialsResource(session, 0).deleteCredential("x"));
         }
     }
 
@@ -362,7 +365,7 @@ class AccountCredentialsResourceTest {
         AuthResult auth = authFor("u", tokenWithAccountRole(AccountRoles.VIEW_PROFILE));
         try (var ignored = mockAuthenticator(auth)) {
             assertThrows(ForbiddenException.class,
-                    () -> new AccountCredentialsResource(session).deleteCredential("x"));
+                    () -> new AccountCredentialsResource(session, 0).deleteCredential("x"));
         }
     }
 
@@ -381,7 +384,7 @@ class AccountCredentialsResourceTest {
         // getStoredCredentialById returns null (unstubbed), user is not federated
         try (var ignored = mockAuthenticator(auth)) {
             assertThrows(NotFoundException.class,
-                    () -> new AccountCredentialsResource(session).deleteCredential("nope"));
+                    () -> new AccountCredentialsResource(session, 0).deleteCredential("nope"));
         }
     }
 
@@ -404,7 +407,7 @@ class AccountCredentialsResourceTest {
                 MockedStatic<CredentialDeleteHelper> helper = mockStatic(CredentialDeleteHelper.class)) {
             helper.when(() -> CredentialDeleteHelper.removeCredential(
                     eq(h.session()), eq(user), eq("pk-1"), any())).thenReturn(removed);
-            Response response = new AccountCredentialsResource(h.session()).deleteCredential("pk-1");
+            Response response = new AccountCredentialsResource(h.session(), 0).deleteCredential("pk-1");
             assertEquals(204, response.getStatus());
         }
 
@@ -437,7 +440,7 @@ class AccountCredentialsResourceTest {
                 MockedStatic<CredentialDeleteHelper> helper = mockStatic(CredentialDeleteHelper.class)) {
             helper.when(() -> CredentialDeleteHelper.removeCredential(
                     eq(h.session()), eq(user), eq("otp-1"), any())).thenReturn(removed);
-            assertEquals(204, new AccountCredentialsResource(h.session()).deleteCredential("otp-1").getStatus());
+            assertEquals(204, new AccountCredentialsResource(h.session(), 0).deleteCredential("otp-1").getStatus());
         }
 
         ArgumentCaptor<Event> captor = ArgumentCaptor.forClass(Event.class);
@@ -462,8 +465,116 @@ class AccountCredentialsResourceTest {
                 MockedStatic<CredentialDeleteHelper> helper = mockStatic(CredentialDeleteHelper.class)) {
             helper.when(() -> CredentialDeleteHelper.removeCredential(any(), any(), any(), any()))
                     .thenReturn(null);
-            assertEquals(204, new AccountCredentialsResource(session).deleteCredential("otp-id").getStatus());
+            assertEquals(204, new AccountCredentialsResource(session, 0).deleteCredential("otp-id").getStatus());
         }
+    }
+
+    // ---- deleteCredential: recent-authentication gate --------------------------
+
+    /** A user session whose last interactive authentication is known. */
+    private static UserSessionModel sessionAuthedAt(Integer authTimeNote, int started) {
+        UserSessionModel us = mock(UserSessionModel.class);
+        if (authTimeNote != null) {
+            when(us.getNote(AuthenticationManager.AUTH_TIME)).thenReturn(String.valueOf(authTimeNote));
+        }
+        when(us.getStarted()).thenReturn(started);
+        return us;
+    }
+
+    /**
+     * A stale session is refused with a machine-readable marker: removal is
+     * how a takeover consolidates itself, so it must ride a recent, deliberate
+     * authentication — the client re-authenticates and retries.
+     */
+    @Test
+    void deleteCredential_staleSession_forbidden_namesReauthentication() {
+        KeycloakSession session = sessionWithEnabledAccountClient();
+        corsFor(session);
+        AuthResult auth = authFor("u", tokenWithAccountRole(AccountRoles.MANAGE_ACCOUNT));
+        UserSessionModel stale = sessionAuthedAt(Time.currentTime() - 3600, Time.currentTime() - 3600);
+        when(auth.session()).thenReturn(stale);
+        try (var ignored = mockAuthenticator(auth)) {
+            ForbiddenException ex = assertThrows(ForbiddenException.class,
+                    () -> new AccountCredentialsResource(session, 60).deleteCredential("pk-1"));
+            assertEquals(403, ex.getResponse().getStatus());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> body = (Map<String, Object>) ex.getResponse().getEntity();
+            assertEquals(AccountCredentialsResource.ERROR_REAUTHENTICATION_REQUIRED, body.get("error"));
+            assertEquals(60, body.get("maxAuthAgeSeconds"));
+        }
+    }
+
+    /**
+     * The AUTH_TIME note wins over an old session start: a prompt=login pass
+     * over an existing SSO session re-freshes exactly that note, which is what
+     * lets the client retry with its EXISTING access token.
+     */
+    @Test
+    void deleteCredential_freshNoteOnOldSession_deletes() {
+        KeycloakSession session = sessionWithEnabledAccountClient();
+        corsFor(session);
+        AuthResult auth = authFor("u", tokenWithAccountRole(AccountRoles.MANAGE_ACCOUNT));
+        UserSessionModel refreshed = sessionAuthedAt(Time.currentTime() - 5, Time.currentTime() - 3600);
+        when(auth.session()).thenReturn(refreshed);
+        try (var ignored = mockAuthenticator(auth);
+                MockedStatic<CredentialDeleteHelper> helper = mockStatic(CredentialDeleteHelper.class)) {
+            helper.when(() -> CredentialDeleteHelper.removeCredential(any(), any(), any(), any()))
+                    .thenReturn(null);
+            assertEquals(204, new AccountCredentialsResource(session, 60).deleteCredential("pk-1").getStatus());
+        }
+    }
+
+    /** No note, fresh session start — the direct-grant shape — passes. */
+    @Test
+    void deleteCredential_noNote_freshSessionStart_deletes() {
+        KeycloakSession session = sessionWithEnabledAccountClient();
+        corsFor(session);
+        AuthResult auth = authFor("u", tokenWithAccountRole(AccountRoles.MANAGE_ACCOUNT));
+        UserSessionModel fresh = sessionAuthedAt(null, Time.currentTime() - 5);
+        when(auth.session()).thenReturn(fresh);
+        try (var ignored = mockAuthenticator(auth);
+                MockedStatic<CredentialDeleteHelper> helper = mockStatic(CredentialDeleteHelper.class)) {
+            helper.when(() -> CredentialDeleteHelper.removeCredential(any(), any(), any(), any()))
+                    .thenReturn(null);
+            assertEquals(204, new AccountCredentialsResource(session, 60).deleteCredential("pk-1").getStatus());
+        }
+    }
+
+    /** {@code delete-max-auth-age=0} disables the gate wholesale. */
+    @Test
+    void deleteCredential_gateDisabled_staleSessionStillDeletes() {
+        KeycloakSession session = sessionWithEnabledAccountClient();
+        corsFor(session);
+        AuthResult auth = authFor("u", tokenWithAccountRole(AccountRoles.MANAGE_ACCOUNT));
+        UserSessionModel stale = sessionAuthedAt(Time.currentTime() - 3600, Time.currentTime() - 3600);
+        when(auth.session()).thenReturn(stale);
+        try (var ignored = mockAuthenticator(auth);
+                MockedStatic<CredentialDeleteHelper> helper = mockStatic(CredentialDeleteHelper.class)) {
+            helper.when(() -> CredentialDeleteHelper.removeCredential(any(), any(), any(), any()))
+                    .thenReturn(null);
+            assertEquals(204, new AccountCredentialsResource(session, 0).deleteCredential("pk-1").getStatus());
+        }
+    }
+
+    // ---- authTimeOf ------------------------------------------------------------
+
+    @Test
+    void authTimeOf_noteWinsOverStart() {
+        UserSessionModel us = sessionAuthedAt(1000, 500);
+        assertEquals(1000, AccountCredentialsResource.authTimeOf(us));
+    }
+
+    @Test
+    void authTimeOf_unparsableNote_fallsBackToStart() {
+        UserSessionModel us = mock(UserSessionModel.class);
+        when(us.getNote(AuthenticationManager.AUTH_TIME)).thenReturn("not-a-number");
+        when(us.getStarted()).thenReturn(500);
+        assertEquals(500, AccountCredentialsResource.authTimeOf(us));
+    }
+
+    @Test
+    void authTimeOf_nullSession_zero() {
+        assertEquals(0, AccountCredentialsResource.authTimeOf(null));
     }
 
     // ---- currentAuthenticatedLevel ---------------------------------------------
@@ -618,7 +729,7 @@ class AccountCredentialsResourceTest {
     }
 
     private static void drain(KeycloakSession session) {
-        try (Stream<?> s = new AccountCredentialsResource(session).getCredentials()) {
+        try (Stream<?> s = new AccountCredentialsResource(session, 0).getCredentials()) {
             s.forEach(x -> { });
         }
     }

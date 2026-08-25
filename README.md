@@ -89,6 +89,35 @@ below what removing that credential type requires. On success the same
 OTP credentials), so realm event listeners and the event store see
 extension-initiated removals exactly like built-in ones.
 
+### Recent authentication (since 0.3.0)
+
+Removing a credential is how an account takeover consolidates itself, so
+`DELETE` additionally requires a **recent** authentication: the caller's
+session must have authenticated within the last `delete-max-auth-age`
+seconds (default **60**; `0` disables the check):
+
+```
+--spi-realm-restapi-extension--account-credentials--delete-max-auth-age=300
+```
+
+A stale session gets `403` with a machine-readable body:
+
+```json
+{ "error": "reauthentication_required", "maxAuthAgeSeconds": 60 }
+```
+
+That is the client's cue to send the user through a fresh login
+(`prompt=login`) and retry. Freshness is read from the **server-side user
+session** (the `AUTH_TIME` note, falling back to the session start), not
+from a token claim — access tokens from some grants carry no `auth_time`,
+and a re-authentication updates the session the caller's existing token
+already maps to, so the retry needs **no token refresh**.
+
+> **Upgrading from 0.2.0:** this is the release's one behavioural change.
+> Clients that delete credentials must either handle the
+> `reauthentication_required` 403 or the deployment must set
+> `delete-max-auth-age=0` to keep the old behaviour.
+
 ### Responses
 
 | Status | `GET …/me` | `DELETE …/{credentialId}` |
@@ -97,7 +126,7 @@ extension-initiated removals exactly like built-in ones.
 | `204`  | — | Credential removed |
 | `400`  | — | Credential type cannot be removed (e.g. password) |
 | `401`  | Missing/invalid bearer token, wrong audience, or a service-account token | same |
-| `403`  | Token lacks the account `view-profile`/`manage-account` role, or disallowed CORS origin | token lacks `manage-account`, disallowed origin, or insufficient step-up level |
+| `403`  | Token lacks the account `view-profile`/`manage-account` role, or disallowed CORS origin | token lacks `manage-account`, disallowed origin, insufficient step-up level, or a stale session (`reauthentication_required`, see above) |
 | `404`  | The realm's `account` client is missing or disabled (mirrors the built-in account API) | same — or the id is not in the caller's own store |
 
 A `200` body:

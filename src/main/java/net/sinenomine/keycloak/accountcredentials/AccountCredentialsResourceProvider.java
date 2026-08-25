@@ -15,14 +15,16 @@ import org.keycloak.services.resource.RealmResourceProvider;
 public class AccountCredentialsResourceProvider implements RealmResourceProvider {
 
     private final KeycloakSession session;
+    private final int deleteMaxAuthAge;
 
-    public AccountCredentialsResourceProvider(KeycloakSession session) {
+    public AccountCredentialsResourceProvider(KeycloakSession session, int deleteMaxAuthAge) {
         this.session = session;
+        this.deleteMaxAuthAge = deleteMaxAuthAge;
     }
 
     @Override
     public Object getResource() {
-        return new AccountCredentialsResource(session);
+        return new AccountCredentialsResource(session, deleteMaxAuthAge);
     }
 
     @Override
