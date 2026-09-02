@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: "/"
+    schedule:
+      interval: weekly
+    # keycloak.version bumps surface Keycloak releases early; the CI matrix
+    # then proves (or disproves) compatibility
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
