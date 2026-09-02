@@ -215,4 +215,6 @@ Part of a small family of self-contained Keycloak extensions:
 
 ## License
 
-[Apache License 2.0](LICENSE)
+Copyright 2026 [Sine Nomine Associates](https://www.sinenomine.net) and contributors.
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
