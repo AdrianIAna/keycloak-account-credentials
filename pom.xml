@@ -149,9 +149,6 @@
               META-INF/services, leaving an inert provider JAR that still builds.
               PackagedJarIT pins both halves.
             -->
-            <resource>
-                <directory>src/main/resources</directory>
-            </resource>
             <!-- Apache-2.0 4(d): ship LICENSE and NOTICE inside the artifact,
                  not just at the repo root, so they reach whoever takes the jar. -->
             <resource>
