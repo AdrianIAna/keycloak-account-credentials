@@ -23,12 +23,28 @@
     </description>
     <url>https://github.com/AdrianIAna/keycloak-account-credentials</url>
 
+    <inceptionYear>2026</inceptionYear>
+
+    <organization>
+        <name>Sine Nomine Associates</name>
+        <url>https://www.sinenomine.net</url>
+    </organization>
+
     <licenses>
         <license>
             <name>Apache License, Version 2.0</name>
             <url>https://www.apache.org/licenses/LICENSE-2.0</url>
         </license>
     </licenses>
+
+    <developers>
+        <developer>
+            <name>Adrian Ana</name>
+            <email>aana@sinenomine.net</email>
+            <organization>Sine Nomine Associates</organization>
+            <organizationUrl>https://www.sinenomine.net</organizationUrl>
+        </developer>
+    </developers>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
