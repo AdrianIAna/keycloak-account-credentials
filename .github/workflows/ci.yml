@@ -16,7 +16,7 @@ jobs:
     name: JDK ${{ matrix.java }} / Keycloak ${{ matrix.keycloak }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
